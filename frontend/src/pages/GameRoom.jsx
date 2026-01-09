@@ -496,6 +496,21 @@ export default function GameRoom({ socket }) {
     try {
       setMessage("Settling game on blockchain...");
 
+      // Validate chip counts before settlement
+      const hasInvalidChips = playerChips.some((pc) => {
+        const chips = pc.chips;
+        return (
+          typeof chips !== "number" ||
+          !Number.isFinite(chips) ||
+          chips < 0
+        );
+      });
+
+      if (hasInvalidChips) {
+        console.error("Invalid chip amounts detected:", playerChips);
+        throw new Error("Cannot settle game: invalid chip amounts detected");
+      }
+
       // Extract player addresses and chip amounts from playerChips array
       const players = playerChips.map(pc => pc.id);
       const finalChips = playerChips.map(pc => Math.floor(pc.chips));
@@ -1082,8 +1097,8 @@ export default function GameRoom({ socket }) {
                                       <div
                                         key={playerChip.id}
                                         className={`flex items-center justify-between p-3 rounded-xl ${isWinner
-                                            ? 'bg-yellow-500/20 border border-yellow-500/30'
-                                            : 'bg-white/5 border border-white/5'
+                                          ? 'bg-yellow-500/20 border border-yellow-500/30'
+                                          : 'bg-white/5 border border-white/5'
                                           }`}
                                       >
                                         <div className="flex items-center gap-3">

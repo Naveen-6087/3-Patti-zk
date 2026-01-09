@@ -4,6 +4,7 @@ import { Server } from "socket.io";
 import cors from "cors";
 import { v4 as uuidv4 } from "uuid";
 import { Game, Player } from "./gameLogic.js";
+import settlementService from "./blockchain/settlementService.js";
 
 const app = express();
 const httpServer = createServer(app);
@@ -25,6 +26,54 @@ const playerSockets = new Map();
 
 app.get("/health", (req, res) => {
   res.json({ status: "ok", activeGames: games.size });
+});
+
+// Settlement API endpoint
+app.post("/api/settle-game", async (req, res) => {
+  try {
+    const { roomId, playerChips, blockchainRoomId } = req.body;
+
+    // Validate inputs
+    if (!blockchainRoomId || !playerChips || !Array.isArray(playerChips)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: blockchainRoomId and playerChips'
+      });
+    }
+
+    // Verify settlement service is ready
+    if (!settlementService.isInitialized()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Settlement service not initialized. Check server logs.'
+      });
+    }
+
+    // Optional: Verify game exists and matches chip counts
+    if (roomId && games.has(roomId)) {
+      const game = games.get(roomId);
+      console.log(`Settling game ${roomId} (blockchain: ${blockchainRoomId})`);
+      console.log('Final chip counts:', playerChips);
+    }
+
+    // Call settlement service
+    const result = await settlementService.settleCashGame(blockchainRoomId, playerChips);
+
+    if (result.success) {
+      console.log(`✅ Game ${blockchainRoomId} settled successfully: ${result.txHash}`);
+      return res.json(result);
+    } else {
+      console.error(`❌ Settlement failed: ${result.error}`);
+      return res.status(400).json(result);
+    }
+
+  } catch (error) {
+    console.error('API error in /api/settle-game:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Internal server error'
+    });
+  }
 });
 
 io.on("connection", (socket) => {
@@ -495,6 +544,17 @@ io.on("connection", (socket) => {
 
 const PORT = process.env.PORT || 3001;
 
-httpServer.listen(PORT, () => {
-  console.log(`Teen Patti server running on port ${PORT}`);
-});
+// Initialize settlement service and start server
+(async () => {
+  console.log('\n🚀 Starting Teen Patti Server...\n');
+
+  // Initialize settlement service
+  await settlementService.initialize();
+
+  // Start HTTP server
+  httpServer.listen(PORT, () => {
+    console.log(`\n✅ Server running on port ${PORT}`);
+    console.log(`📡 WebSocket server ready`);
+    console.log(`🎮 Ready for games!\n`);
+  });
+})();

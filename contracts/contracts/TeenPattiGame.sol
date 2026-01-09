@@ -239,12 +239,13 @@ contract TeenPattiGame is Ownable, ReentrancyGuard, Pausable {
     
     /**
      * @dev Settle cash game with proportional payouts based on final chips
+     * @notice Only owner (backend) can call this with verified chip counts
      */
     function settleCashGame(
         bytes32 _roomId,
         address[] memory _players,
         uint256[] memory _finalChips
-    ) external nonReentrant {
+    ) external onlyOwner nonReentrant {
         Room storage room = rooms[_roomId];
         
         require(room.state == GameState.ACTIVE, "Game not active");

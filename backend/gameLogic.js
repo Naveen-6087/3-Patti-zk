@@ -187,9 +187,8 @@ export class Game {
     // Safety check: ensure there are active players
     const activePlayers = this.getActivePlayers();
     if (activePlayers.length <= 1) {
-      // Game should end, don't advance turn
-      console.warn('nextPlayer called but only', activePlayers.length, 'active players remain');
-      return;
+      // Game should end; attempting to advance turn is a logic error
+      throw new Error(`Cannot advance turn: only ${activePlayers.length} active player(s) remain. Game should have ended.`);
     }
 
     let count = 0;
@@ -198,7 +197,7 @@ export class Game {
       count++;
       if (count > this.players.length) {
         console.error('nextPlayer: No active players found! This should not happen.');
-        break;
+        throw new Error('No active non-folded players found');
       }
     } while (this.players[this.currentPlayerIndex].isFolded);
 
