@@ -189,6 +189,13 @@ export default function GameRoom({ socket }) {
       }
     });
 
+    // Listen for settlement confirmation from backend
+    socket.on("gameSettled", ({ txHash }) => {
+      console.log("Game settled on blockchain:", txHash);
+      setMessage(`💰 Tokens distributed! TX: ${txHash.slice(0, 10)}...`);
+      setTimeout(() => setMessage(""), 5000);
+    });
+
     socket.on(
       "playerLeft",
       ({ playerName: leftPlayerName, gameState: newGameState }) => {
@@ -515,9 +522,15 @@ export default function GameRoom({ socket }) {
       const players = playerChips.map(pc => pc.id);
       const finalChips = playerChips.map(pc => Math.floor(pc.chips));
 
-      console.log("Settling cash game:", { blockchainRoomId, players, finalChips });
+      console.log("Calling backend API:", { roomId, blockchainRoomId, playerChips });
 
-      const result = await settleCashGame(blockchainRoomId, players, finalChips);
+      const response = await fetch('http://localhost:3001/api/settle-game', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId, blockchainRoomId, playerChips })
+      });
+
+      const result = await response.json();
 
       if (!result.success) {
         throw new Error(
