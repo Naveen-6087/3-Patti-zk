@@ -149,6 +149,10 @@ export class Game {
 
     this.gameStarted = true;
     this.deck.reset();
+
+    // Snapshot shuffled deck for ZK proof generation (before dealing removes cards)
+    this.shuffledDeckSnapshot = this.deck.cards.map(c => ({ rank: c.rank, suit: c.suit }));
+
     this.pot = 0;
     this.currentBet = this.minBet;
     this.roundNumber = 0;
@@ -213,7 +217,10 @@ export class Game {
     switch (action) {
       case 'fold':
         player.fold();
-        this.nextPlayer();
+        // Check if only 1 active player remains (game over, skip nextPlayer)
+        if (this.getActivePlayers().length > 1) {
+          this.nextPlayer();
+        }
         return { success: true };
 
       case 'see':
@@ -304,7 +311,10 @@ export class Game {
 
       case 'pack':
         player.fold();
-        this.nextPlayer();
+        // Check if only 1 active player remains (game over, skip nextPlayer)
+        if (this.getActivePlayers().length > 1) {
+          this.nextPlayer();
+        }
         return { success: true };
 
       default:
@@ -449,5 +459,14 @@ export class Game {
   getPlayerCards(playerId) {
     const player = this.getPlayer(playerId);
     return player ? player.cards : [];
+  }
+
+  /**
+   * Get the full shuffled deck snapshot (52 cards in shuffled order).
+   * Used by frontend for ZK proof generation.
+   * @returns {Array<{rank: string, suit: string}>}
+   */
+  getShuffledDeck() {
+    return this.shuffledDeckSnapshot || [];
   }
 }

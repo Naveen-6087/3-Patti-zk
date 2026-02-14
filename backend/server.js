@@ -3,6 +3,8 @@ import { createServer } from "http";
 import { Server } from "socket.io";
 import cors from "cors";
 import { v4 as uuidv4 } from "uuid";
+import dotenv from "dotenv";
+dotenv.config();
 import { Game, Player } from "./gameLogic.js";
 import settlementService from "./blockchain/settlementService.js";
 
@@ -438,9 +440,10 @@ io.on("connection", (socket) => {
 
     game.startGame();
 
-    // Send game state to all players
+    // Send game state + shuffled deck to all players (deck needed for ZK proofs)
     io.to(playerInfo.roomId).emit("gameStarted", {
       gameState: game.getGameState(),
+      shuffledDeck: game.getShuffledDeck(),
     });
 
     // Send cards to each player privately
