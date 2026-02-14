@@ -1,0 +1,7 @@
+[workspace]
+members = ["lib", "shuffle", "deal", "show"]
+default-member = "shuffle"
+
+# Noir 1.0.0-beta.6 compatible workspace
+# Required for zkVerify UltraHonk compatibility
+# bb v0.84.0 | @noir-lang/noir_js v1.0.0-beta.6 | @aztec/bb.js v0.84.0
