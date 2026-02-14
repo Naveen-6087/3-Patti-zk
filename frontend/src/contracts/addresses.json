@@ -1,7 +1,9 @@
 {
-  "baseSepolia": {
-    "chainId": 84532,
-    "TeenPattiToken": "0x4Eb7661874199799d7C212DC70e28D7de003BB90",
-    "TeenPattiGame": "0x3bCf7e0eD5EEF358cD3Cc9964e57C8D6c19E2e47"
+  "hardhat": {
+    "TeenPattiToken": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+    "ShuffleVerifier": "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512",
+    "DealVerifier": "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0",
+    "ShowVerifier": "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9",
+    "TeenPattiGame": "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"
   }
 }

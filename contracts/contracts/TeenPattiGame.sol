@@ -5,16 +5,26 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
+import {IVerifier} from "./verifiers/HonkBase.sol";
 
 /**
  * @title TeenPattiGame
- * @dev Manages Teen Patti game rooms, bets, and payouts
+ * @dev Manages Teen Patti game rooms, bets, payouts, and ZK proof verification.
+ *      Integrates Noir ZK circuits: shuffle (deck fairness), deal (card ownership),
+ *      show (hand reveal with ranking).
  */
 contract TeenPattiGame is Ownable, ReentrancyGuard, Pausable {
     IERC20 public token;
-    
+
+    // ZK Verifier contracts
+    IVerifier public shuffleVerifier;
+    IVerifier public dealVerifier;
+    IVerifier public showVerifier;
+
+    enum CircuitType { Shuffle, Deal, Show }
+
     // Game states
-    enum GameState { WAITING, ACTIVE, FINISHED, CANCELLED }
+    enum GameState { WAITING, ACTIVE, SHOWING, FINISHED, CANCELLED }
     
     // Room structure
     struct Room {
@@ -28,13 +38,26 @@ contract TeenPattiGame is Ownable, ReentrancyGuard, Pausable {
         address winner;
         uint256 createdAt;
         uint256 finishedAt;
+        bytes32 deckCommitment;        // Merkle root of shuffled deck
+        bytes32[] proofCommitments;    // ZK proof commitments for audit trail
         mapping(address => uint256) playerBalances;
         mapping(address => bool) hasJoined;
+        mapping(address => bool) hasShownHand;
+    }
+
+    // ZK proof record for audit
+    struct ProofRecord {
+        bytes32 commitment;
+        address player;
+        CircuitType circuitType;
+        uint256 timestamp;
+        bool verified;
     }
     
     // State variables
     mapping(bytes32 => Room) public rooms;
     mapping(address => bytes32[]) public playerRooms;
+    mapping(bytes32 => ProofRecord[]) public roomProofs;
     bytes32[] public activeRoomIds;
     
     // Platform rake (in basis points, 100 = 1%)
@@ -50,6 +73,7 @@ contract TeenPattiGame is Ownable, ReentrancyGuard, Pausable {
     event PlayerJoined(bytes32 indexed roomId, address indexed player, uint256 buyIn);
     event PlayerLeft(bytes32 indexed roomId, address indexed player, uint256 refund);
     event GameStarted(bytes32 indexed roomId, uint256 pot, uint256 playerCount);
+    event GameStartedWithProof(bytes32 indexed roomId, bytes32 deckCommitment, uint256 playerCount);
     event BetPlaced(bytes32 indexed roomId, address indexed player, uint256 amount);
     event WinnerDeclared(bytes32 indexed roomId, address indexed winner, uint256 amount, uint256 rake);
     event CashGameSettled(bytes32 indexed roomId, address[] players, uint256[] payouts, uint256 rake);
@@ -57,13 +81,28 @@ contract TeenPattiGame is Ownable, ReentrancyGuard, Pausable {
     event RakeFeeUpdated(uint256 newRakeFee);
     event TreasuryUpdated(address indexed newTreasury);
     event EmergencyWithdraw(bytes32 indexed roomId, address indexed player, uint256 amount);
+    event ProofVerified(bytes32 indexed roomId, address indexed player, CircuitType circuitType);
+    event HandShown(bytes32 indexed roomId, address indexed player, uint256 handRank);
+    event VerifiersUpdated(address shuffleVerifier, address dealVerifier, address showVerifier);
     
-    constructor(address _token, address _treasury) Ownable(msg.sender) {
+    constructor(
+        address _token,
+        address _treasury,
+        address _shuffleVerifier,
+        address _dealVerifier,
+        address _showVerifier
+    ) Ownable(msg.sender) {
         require(_token != address(0), "Invalid token address");
         require(_treasury != address(0), "Invalid treasury address");
+        require(_shuffleVerifier != address(0), "Invalid shuffle verifier");
+        require(_dealVerifier != address(0), "Invalid deal verifier");
+        require(_showVerifier != address(0), "Invalid show verifier");
         
         token = IERC20(_token);
         treasury = _treasury;
+        shuffleVerifier = IVerifier(_shuffleVerifier);
+        dealVerifier = IVerifier(_dealVerifier);
+        showVerifier = IVerifier(_showVerifier);
     }
     
     /**
@@ -183,6 +222,127 @@ contract TeenPattiGame is Ownable, ReentrancyGuard, Pausable {
         room.state = GameState.ACTIVE;
         
         emit GameStarted(_roomId, room.pot, room.players.length);
+    }
+
+    /**
+     * @dev Start the game with a verified shuffle proof
+     * @param _roomId The room to start
+     * @param _deckCommitment Merkle root of the shuffled deck
+     * @param _shuffleProof ZK proof bytes from the shuffle circuit
+     * @param _publicInputs Public inputs for the shuffle verifier (empty for shuffle)
+     */
+    function startGameWithProof(
+        bytes32 _roomId,
+        bytes32 _deckCommitment,
+        bytes calldata _shuffleProof,
+        bytes32[] calldata _publicInputs
+    ) external nonReentrant {
+        Room storage room = rooms[_roomId];
+
+        require(room.creator != address(0), "Room does not exist");
+        require(msg.sender == room.creator || msg.sender == owner(), "Not authorized");
+        require(room.state == GameState.WAITING, "Game already started");
+        require(room.players.length >= 2, "Need at least 2 players");
+
+        // Verify shuffle proof on-chain
+        bool isValid = shuffleVerifier.verify(_shuffleProof, _publicInputs);
+        require(isValid, "Invalid shuffle proof");
+
+        room.state = GameState.ACTIVE;
+        room.deckCommitment = _deckCommitment;
+
+        // Record proof
+        roomProofs[_roomId].push(ProofRecord({
+            commitment: _deckCommitment,
+            player: msg.sender,
+            circuitType: CircuitType.Shuffle,
+            timestamp: block.timestamp,
+            verified: true
+        }));
+
+        emit GameStartedWithProof(_roomId, _deckCommitment, room.players.length);
+        emit ProofVerified(_roomId, msg.sender, CircuitType.Shuffle);
+    }
+
+    /**
+     * @dev Verify a deal proof (proves cards were correctly dealt from committed deck)
+     * @param _roomId The room ID
+     * @param _dealProof ZK proof bytes from the deal circuit
+     * @param _publicInputs Public inputs: [player_id, merkle_root]
+     */
+    function verifyDeal(
+        bytes32 _roomId,
+        bytes calldata _dealProof,
+        bytes32[] calldata _publicInputs
+    ) external {
+        Room storage room = rooms[_roomId];
+        require(room.state == GameState.ACTIVE, "Game not active");
+        require(room.hasJoined[msg.sender], "Player not in room");
+
+        bool isValid = dealVerifier.verify(_dealProof, _publicInputs);
+        require(isValid, "Invalid deal proof");
+
+        bytes32 commitment = keccak256(abi.encodePacked(_publicInputs));
+        room.proofCommitments.push(commitment);
+
+        roomProofs[_roomId].push(ProofRecord({
+            commitment: commitment,
+            player: msg.sender,
+            circuitType: CircuitType.Deal,
+            timestamp: block.timestamp,
+            verified: true
+        }));
+
+        emit ProofVerified(_roomId, msg.sender, CircuitType.Deal);
+    }
+
+    /**
+     * @dev Show hand with ZK proof (proves hand ranking from committed cards)
+     * @param _roomId The room ID
+     * @param _showProof ZK proof bytes from the show circuit
+     * @param _publicInputs Public inputs: [game_id, player_id, merkle_root,
+     *        card_rank_0, card_suit_0, card_rank_1, card_suit_1,
+     *        card_rank_2, card_suit_2, hand_rank, hand_value]
+     */
+    function showHand(
+        bytes32 _roomId,
+        bytes calldata _showProof,
+        bytes32[] calldata _publicInputs
+    ) external {
+        Room storage room = rooms[_roomId];
+        require(
+            room.state == GameState.ACTIVE || room.state == GameState.SHOWING,
+            "Game not in play/show phase"
+        );
+        require(room.hasJoined[msg.sender], "Player not in room");
+        require(!room.hasShownHand[msg.sender], "Hand already shown");
+
+        bool isValid = showVerifier.verify(_showProof, _publicInputs);
+        require(isValid, "Invalid show proof");
+
+        room.hasShownHand[msg.sender] = true;
+
+        // Move to SHOWING state on first show
+        if (room.state == GameState.ACTIVE) {
+            room.state = GameState.SHOWING;
+        }
+
+        // hand_rank is the 10th public input (0-indexed: index 9)
+        uint256 handRank = uint256(_publicInputs[9]);
+
+        bytes32 commitment = keccak256(abi.encodePacked(_publicInputs));
+        room.proofCommitments.push(commitment);
+
+        roomProofs[_roomId].push(ProofRecord({
+            commitment: commitment,
+            player: msg.sender,
+            circuitType: CircuitType.Show,
+            timestamp: block.timestamp,
+            verified: true
+        }));
+
+        emit HandShown(_roomId, msg.sender, handRank);
+        emit ProofVerified(_roomId, msg.sender, CircuitType.Show);
     }
     
     /**
@@ -450,6 +610,32 @@ contract TeenPattiGame is Ownable, ReentrancyGuard, Pausable {
         require(_newTreasury != address(0), "Invalid treasury address");
         treasury = _newTreasury;
         emit TreasuryUpdated(_newTreasury);
+    }
+
+    /**
+     * @dev Update ZK verifier contracts (only owner)
+     */
+    function updateVerifiers(
+        address _shuffleVerifier,
+        address _dealVerifier,
+        address _showVerifier
+    ) external onlyOwner {
+        require(_shuffleVerifier != address(0), "Invalid shuffle verifier");
+        require(_dealVerifier != address(0), "Invalid deal verifier");
+        require(_showVerifier != address(0), "Invalid show verifier");
+
+        shuffleVerifier = IVerifier(_shuffleVerifier);
+        dealVerifier = IVerifier(_dealVerifier);
+        showVerifier = IVerifier(_showVerifier);
+
+        emit VerifiersUpdated(_shuffleVerifier, _dealVerifier, _showVerifier);
+    }
+
+    /**
+     * @dev Get ZK proof records for a room
+     */
+    function getRoomProofs(bytes32 _roomId) external view returns (ProofRecord[] memory) {
+        return roomProofs[_roomId];
     }
     
     /**
