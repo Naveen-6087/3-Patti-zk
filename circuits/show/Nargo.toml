@@ -1,0 +1,8 @@
+[package]
+name = "show_circuit"
+type = "bin"
+authors = ["Teen Patti ZK Team"]
+compiler_version = ">=1.0.0"
+
+[dependencies]
+zk_teen_patti = { path = "../lib" }

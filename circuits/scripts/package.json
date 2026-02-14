@@ -1,0 +1,12 @@
+{
+  "name": "teen-patti-circuit-scripts",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Helper scripts for generating test data for ZK Teen Patti circuits",
+  "scripts": {
+    "generate": "node generate_test_data.mjs"
+  },
+  "dependencies": {
+    "@aztec/bb.js": "0.84.0"
+  }
+}

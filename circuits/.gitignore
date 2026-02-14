@@ -1,0 +1,21 @@
+# Build artifacts
+target/
+
+# Node modules (scripts)
+scripts/node_modules/
+node_modules/
+
+# Prover inputs (test data, may contain secrets)
+**/Prover.toml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+*.swp
+*.swo
+
+# Docs (tracked separately)
+docs/
