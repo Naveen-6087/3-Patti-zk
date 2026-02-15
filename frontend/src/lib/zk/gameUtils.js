@@ -270,6 +270,12 @@ export function evaluateHand(cards) {
     isSequence = true;
   }
 
+  const isAceLow = ranks[0] === 14 && ranks[1] === 3 && ranks[2] === 2;
+
+  // Detect specific pair types (must match circuit: pair_high vs pair_low)
+  const pairHigh = ranks[0] === ranks[1] && ranks[1] !== ranks[2];
+  const pairLow = ranks[0] !== ranks[1] && ranks[1] === ranks[2];
+
   let handRank;
   if (isTrail) {
     handRank = HAND_RANK.TRAIL;
@@ -285,12 +291,41 @@ export function evaluateHand(cards) {
     handRank = HAND_RANK.HIGH_CARD;
   }
 
-  // Compute hand value: encode hand rank + individual card ranks for tiebreaking
-  // hand_value = hand_rank * 10^6 + rank0 * 10^4 + rank1 * 10^2 + rank2
+  // Compute hand value — MUST match circuit's evaluate_hand exactly:
+  //   hand_value = hand_rank * 1_000_000 + value_high * 10_000 + value_mid * 100 + value_low
+  //
+  // The circuit adjusts value_high/mid/low for special cases:
+  //   - Ace-low sequence (A-2-3): value_high=3, value_mid=2, value_low=1
+  //   - Pair high (e.g. K-K-5): value_high=pair_rank, value_mid=kicker, value_low=0
+  //   - Pair low  (e.g. K-5-5): value_high=pair_rank, value_mid=kicker, value_low=0
+  let valueHigh = ranks[0];
+  let valueMid = ranks[1];
+  let valueLow = ranks[2];
+
+  if (handRank === HAND_RANK.PURE_SEQUENCE || handRank === HAND_RANK.SEQUENCE) {
+    if (isAceLow) {
+      valueHigh = 3;
+      valueMid = 2;
+      valueLow = 1;
+    }
+  } else if (handRank === HAND_RANK.PAIR) {
+    if (pairHigh) {
+      // e.g. K-K-5 → (K, 5, 0)
+      valueHigh = ranks[0]; // pair rank
+      valueMid = ranks[2];  // kicker
+      valueLow = 0;
+    } else if (pairLow) {
+      // e.g. K-5-5 → (5, K, 0)  — circuit: value_high=mid, value_mid=high
+      valueHigh = ranks[1]; // pair rank
+      valueMid = ranks[0];  // kicker
+      valueLow = 0;
+    }
+  }
+
   const handValue = BigInt(handRank) * 1000000n
-    + BigInt(ranks[0]) * 10000n
-    + BigInt(ranks[1]) * 100n
-    + BigInt(ranks[2]);
+    + BigInt(valueHigh) * 10000n
+    + BigInt(valueMid) * 100n
+    + BigInt(valueLow);
 
   return { handRank, handValue };
 }

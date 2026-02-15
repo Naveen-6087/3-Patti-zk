@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import gsap from "gsap";
 import { useParams, useLocation, useNavigate } from "react-router-dom";
-import { useReadContract } from "wagmi";
+import { useReadContract, useWalletClient, useSwitchChain, useAccount } from "wagmi";
 import {
   Copy,
   Users,
@@ -30,10 +30,18 @@ import {
   generateDealProof,
   generateShowProof,
   submitProofToZkVerify,
+  verifyShowOnChain,
+  verifyOnChainWithTransaction,
 } from "@/lib/zk";
 import GameABI from "@/contracts/TeenPattiGame.json";
 import addresses from "@/contracts/addresses.json";
 import GlowingBackground from "@/components/GlowingBackground";
+
+/** Tiny helper that fires a callback once on mount (avoids side-effects in render). */
+function AutoProceed({ onProceed }) {
+  useEffect(() => { onProceed(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  return null;
+}
 
 export default function GameRoom({ socket }) {
   const { roomId } = useParams();
@@ -70,6 +78,16 @@ export default function GameRoom({ socket }) {
     totalGenerationTime: 0,
   });
 
+  // ── ZK Show Proof Verification Phase ──
+  // Tracks show proof status so users can verify before game ends
+  const [showProofStatus, setShowProofStatus] = useState('idle'); // 'idle' | 'generating' | 'generated' | 'verifying' | 'verified' | 'failed'
+  const [showProofData, setShowProofData] = useState(null);
+  const [showVerifyResult, setShowVerifyResult] = useState(null); // { verified: boolean, error?: string }
+  const [showRecordResult, setShowRecordResult] = useState(null); // { verified: boolean, txHash?: string, error?: string }
+  const [isRecordingShow, setIsRecordingShow] = useState(false);
+  const [pendingGameEndData, setPendingGameEndData] = useState(null);
+  const showProofStatusRef = useRef('idle');
+
   // ── ZK Refs (accessible from async socket handlers) ──
   const deckStateRef = useRef(null);
   const deckStatePromiseRef = useRef(null);
@@ -77,6 +95,12 @@ export default function GameRoom({ socket }) {
   const zkContextRef = useRef(zkContext);
   useEffect(() => { zkEnabledRef.current = zkEnabled; }, [zkEnabled]);
   useEffect(() => { zkContextRef.current = zkContext; });
+
+  // Wallet hooks for on-chain recording
+  const { data: walletClient } = useWalletClient();
+  const { switchChainAsync } = useSwitchChain();
+  const { chain: currentChain, isConnected: isWalletConnected } = useAccount();
+  const BASE_SEPOLIA_CHAIN_ID = 84532;
 
   // Use wagmi's useReadContract to fetch room details reactively
   const { data: blockchainRoomDetails, refetch: refetchRoomDetails } =
@@ -132,6 +156,23 @@ export default function GameRoom({ socket }) {
       setTimeout(() => setMessage(""), 3000);
       // Refresh blockchain data immediately
       if (refetchRoomDetails) refetchRoomDetails();
+
+      // Reset ZK show proof state from previous round
+      setShowProofStatus('idle');
+      showProofStatusRef.current = 'idle';
+      setShowProofData(null);
+      setShowVerifyResult(null);
+      setShowRecordResult(null);
+      setIsRecordingShow(false);
+      setPendingGameEndData(null);
+      setGameEnded(false);
+      setWinnerInfo(null);
+      setIsShowdown(false);
+
+      // Clear proof history so only current game's proofs are visible
+      if (zkContextRef.current.clearProofHistory) {
+        zkContextRef.current.clearProofHistory();
+      }
 
       // ── ZK: Generate shuffle proof ──
       if (zkEnabledRef.current && shuffledDeck && shuffledDeck.length === 52 && zkContextRef.current.isReady) {
@@ -290,6 +331,9 @@ export default function GameRoom({ socket }) {
       // ── ZK: Generate show proof (proves hand was revealed honestly) ──
       if (zkEnabledRef.current && zkContextRef.current.isReady && deckStateRef.current && allCards && allCards[playerId]) {
         try {
+          // Track proof generation status for verification phase
+          setShowProofStatus('generating');
+          showProofStatusRef.current = 'generating';
           notifyZKProof('generating', 'show', 'Generating reveal proof...');
           const myCardsForShow = allCards[playerId];
           const { shuffledUIDs, nonces, merkleRoot, merkleLayers, shuffledDeck } = deckStateRef.current;
@@ -324,7 +368,12 @@ export default function GameRoom({ socket }) {
 
           const proof = await generateShowProof(input);
           const showProofId = zkContextRef.current.trackProof('show', proof);
-          notifyZKProof('success', 'show', 'Hand revealed honestly — ZK verified!');
+          notifyZKProof('success', 'show', 'Show proof generated! Verify it on-chain before proceeding.');
+
+          // Store the proof so user can verify it
+          setShowProofData(proof);
+          setShowProofStatus('generated');
+          showProofStatusRef.current = 'generated';
           setZkStats(prev => ({
             ...prev,
             proofsGenerated: prev.proofsGenerated + 1,
@@ -344,18 +393,29 @@ export default function GameRoom({ socket }) {
         } catch (err) {
           console.error('[ZK] Show proof failed:', err);
           notifyZKProof('error', 'show', `Show proof failed: ${err.message}`);
+          setShowProofStatus('failed');
+          showProofStatusRef.current = 'failed';
         }
       }
     });
 
     socket.on("gameEnded", async ({ winner, pot, allCards, reason, playerChips }) => {
-      setIsShowdown(false); // End showdown mode
       if (allCards) {
-        // Show all cards at the end
         setShowCards(true);
         setAllPlayerCards(allCards);
       }
 
+      // If ZK show proof is still generating or generated (not yet verified),
+      // buffer the gameEnded data so the user can verify before seeing results
+      const proofStatus = showProofStatusRef.current;
+      if (proofStatus === 'generating' || proofStatus === 'generated') {
+        console.log('[ZK] Buffering gameEnded — waiting for show proof verification. Status:', proofStatus);
+        setPendingGameEndData({ winner, pot, allCards, reason, playerChips });
+        return; // Don't end the game yet — let the user verify first
+      }
+
+      // No pending ZK proof, proceed normally
+      setIsShowdown(false);
       setGameEnded(true);
 
       if (winner) {
@@ -773,6 +833,115 @@ export default function GameRoom({ socket }) {
     // Request showdown - compare cards with all remaining players
     socket.emit("show");
   };
+
+  // ── ZK Show Proof Verification Handlers ──
+
+  const handleVerifyShowProof = useCallback(async () => {
+    if (!showProofData) return;
+    setShowProofStatus('verifying');
+    showProofStatusRef.current = 'verifying';
+    notifyZKProof('generating', 'show', 'Verifying show proof on-chain...');
+
+    try {
+      const result = await verifyShowOnChain(showProofData);
+      setShowVerifyResult(result);
+
+      if (result.verified) {
+        setShowProofStatus('verified');
+        showProofStatusRef.current = 'verified';
+        notifyZKProof('success', 'show', 'Show proof verified on-chain! ✓');
+        setZkStats(prev => ({
+          ...prev,
+          proofsVerified: prev.proofsVerified + 1,
+        }));
+      } else {
+        setShowProofStatus('failed');
+        showProofStatusRef.current = 'failed';
+        notifyZKProof('error', 'show', `On-chain verification failed: ${result.error || 'Unknown'}`);
+      }
+    } catch (err) {
+      console.error('[ZK] Show proof on-chain verification error:', err);
+      setShowVerifyResult({ verified: false, error: err.message });
+      setShowProofStatus('failed');
+      showProofStatusRef.current = 'failed';
+      notifyZKProof('error', 'show', `Verification error: ${err.message}`);
+    }
+  }, [showProofData]);
+
+  const handleRecordShowProof = useCallback(async () => {
+    if (!showProofData) return;
+    if (!isWalletConnected || !walletClient) {
+      notifyZKProof('error', 'show', 'Connect your wallet first to record on-chain');
+      return;
+    }
+
+    // Switch to Base Sepolia if needed
+    if (currentChain?.id !== BASE_SEPOLIA_CHAIN_ID) {
+      try {
+        await switchChainAsync({ chainId: BASE_SEPOLIA_CHAIN_ID });
+      } catch (err) {
+        notifyZKProof('error', 'show', 'Failed to switch to Base Sepolia');
+        return;
+      }
+    }
+
+    setIsRecordingShow(true);
+    notifyZKProof('submitting', 'show', 'Recording show proof on-chain (MetaMask)...');
+
+    try {
+      const result = await verifyOnChainWithTransaction('show', showProofData, walletClient);
+      setShowRecordResult(result);
+
+      if (result.verified) {
+        setShowProofStatus('verified');
+        showProofStatusRef.current = 'verified';
+        notifyZKProof('success', 'show', `Show proof recorded on-chain! TX: ${result.txHash?.slice(0, 10)}...`);
+        setZkStats(prev => ({
+          ...prev,
+          proofsVerified: prev.proofsVerified + 1,
+        }));
+      } else if (result.error === 'Transaction rejected by user') {
+        notifyZKProof('error', 'show', 'Transaction cancelled');
+      } else {
+        notifyZKProof('error', 'show', `Recording failed: ${result.error || 'Unknown'}`);
+      }
+    } catch (err) {
+      console.error('[ZK] Show proof recording error:', err);
+      setShowRecordResult({ verified: false, error: err.message });
+      notifyZKProof('error', 'show', `Recording error: ${err.message}`);
+    } finally {
+      setIsRecordingShow(false);
+    }
+  }, [showProofData, walletClient, isWalletConnected, currentChain, switchChainAsync]);
+
+  const handleProceedToResults = useCallback(async () => {
+    const data = pendingGameEndData;
+    // Reset ZK show proof state
+    setShowProofStatus('idle');
+    showProofStatusRef.current = 'idle';
+    setShowProofData(null);
+    setShowVerifyResult(null);
+    setShowRecordResult(null);
+    setIsRecordingShow(false);
+    setPendingGameEndData(null);
+
+    // Now apply the buffered gameEnded data
+    setIsShowdown(false);
+    setGameEnded(true);
+
+    if (data && data.winner) {
+      setWinnerInfo({ name: data.winner.name, pot: data.pot, reason: data.reason, playerChips: data.playerChips });
+      setMessage(
+        `${data.winner.name} wins ${formatChips(data.pot)} chips! ${data.reason || ""}`
+      );
+
+      if (blockchainRoomId && data.playerChips && handleSettleCashGameRef.current) {
+        await handleSettleCashGameRef.current(data.playerChips);
+      }
+    } else if (data) {
+      setMessage(`Game ended. ${data.reason || ""}`);
+    }
+  }, [pendingGameEndData, blockchainRoomId]);
 
   const handleLeaveRoom = () => {
     socket.emit("leaveRoom");
@@ -1253,8 +1422,156 @@ export default function GameRoom({ socket }) {
                 </React.Fragment>
               ))}
             </div>
+
+            {/* ── ZK Show Proof Verification Phase ── */}
+            {zkEnabled && showProofStatus !== 'idle' && (
+              <div className="mt-10 mx-auto max-w-md">
+                <div className="bg-black/60 backdrop-blur-xl rounded-2xl border border-white/10 p-6 shadow-2xl">
+                  <div className="flex items-center gap-3 mb-4">
+                    <svg className="w-5 h-5 text-green-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M12 2L2 7l10 5 10-5-10-5z" />
+                      <path d="M2 17l10 5 10-5" />
+                      <path d="M2 12l10 5 10-5" />
+                    </svg>
+                    <span className="text-white font-bold text-sm tracking-wide uppercase">ZK Proof Verification</span>
+                  </div>
+
+                  {/* Status indicator */}
+                  <div className="mb-4">
+                    {showProofStatus === 'generating' && (
+                      <div className="flex items-center gap-3 text-yellow-300 text-sm">
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        <span>Generating show proof...</span>
+                      </div>
+                    )}
+                    {showProofStatus === 'generated' && (
+                      <div className="flex items-center gap-3 text-blue-300 text-sm">
+                        <span className="text-lg">✓</span>
+                        <span>Show proof generated — ready to verify on-chain</span>
+                      </div>
+                    )}
+                    {showProofStatus === 'verifying' && (
+                      <div className="flex items-center gap-3 text-blue-300 text-sm">
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        <span>Verifying on-chain (Base Sepolia)...</span>
+                      </div>
+                    )}
+                    {showProofStatus === 'verified' && (
+                      <div className="flex items-center gap-3 text-green-400 text-sm">
+                        <span className="text-lg">✓</span>
+                        <span>
+                          Verified on-chain! Hand was revealed honestly.
+                          {showRecordResult?.txHash && (
+                            <a
+                              href={`https://sepolia.basescan.org/tx/${showRecordResult.txHash}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="ml-2 text-purple-400 hover:text-purple-300 underline"
+                            >
+                              TX ↗
+                            </a>
+                          )}
+                        </span>
+                      </div>
+                    )}
+                    {showProofStatus === 'failed' && (
+                      <div className="flex items-center gap-3 text-red-400 text-sm">
+                        <span className="text-lg">✗</span>
+                        <span>Verification failed{showVerifyResult?.error ? `: ${showVerifyResult.error}` : ''}</span>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Action buttons */}
+                  <div className="flex gap-3 flex-wrap">
+                    {showProofStatus === 'generated' && (
+                      <>
+                        <button
+                          onClick={handleVerifyShowProof}
+                          disabled={isRecordingShow}
+                          className="flex-1 h-10 px-4 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:bg-gray-600 disabled:cursor-not-allowed text-white text-sm font-bold shadow-lg border border-blue-400/30 transition-all hover:scale-105 active:scale-95 flex items-center justify-center gap-2"
+                          title="Verify proof (free, no gas)"
+                        >
+                          <Eye size={16} /> Verify
+                        </button>
+                        <button
+                          onClick={handleRecordShowProof}
+                          disabled={isRecordingShow}
+                          className="flex-1 h-10 px-4 rounded-xl bg-purple-600 hover:bg-purple-500 disabled:bg-gray-600 disabled:cursor-not-allowed text-white text-sm font-bold shadow-lg border border-purple-400/30 transition-all hover:scale-105 active:scale-95 flex items-center justify-center gap-2"
+                          title="Record proof on-chain (MetaMask, costs gas)"
+                        >
+                          {isRecordingShow ? <Loader2 size={16} className="animate-spin" /> : '📜'} Record
+                        </button>
+                      </>
+                    )}
+
+                    {showProofStatus === 'verified' && !showRecordResult?.txHash && (
+                      <button
+                        onClick={handleRecordShowProof}
+                        disabled={isRecordingShow}
+                        className="flex-1 h-10 px-4 rounded-xl bg-purple-600 hover:bg-purple-500 disabled:bg-gray-600 disabled:cursor-not-allowed text-white text-sm font-bold shadow-lg border border-purple-400/30 transition-all hover:scale-105 active:scale-95 flex items-center justify-center gap-2"
+                        title="Record proof on-chain (MetaMask, costs gas)"
+                      >
+                        {isRecordingShow ? <Loader2 size={16} className="animate-spin" /> : '📜'} Record On-Chain
+                      </button>
+                    )}
+
+                    {(showProofStatus === 'verified' || showProofStatus === 'failed') && pendingGameEndData && (
+                      <button
+                        onClick={handleProceedToResults}
+                        className="flex-1 h-10 px-4 rounded-xl bg-yellow-600 hover:bg-yellow-500 text-white text-sm font-bold shadow-lg border border-yellow-400/30 transition-all hover:scale-105 active:scale-95 flex items-center justify-center gap-2"
+                      >
+                        <Trophy size={16} /> See Results
+                      </button>
+                    )}
+
+                    {(showProofStatus === 'generated' || showProofStatus === 'generating') && pendingGameEndData && (
+                      <button
+                        onClick={handleProceedToResults}
+                        className="h-10 px-4 rounded-xl bg-white/10 hover:bg-white/20 text-gray-300 text-sm font-medium border border-white/10 transition-all flex items-center justify-center gap-2"
+                      >
+                        Skip
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Legend */}
+                  {showProofStatus === 'generated' && (
+                    <div className="flex items-center gap-4 text-[10px] text-gray-500 mt-2">
+                      <span className="flex items-center gap-1">
+                        <span className="inline-block w-1.5 h-1.5 rounded-full bg-blue-500" />
+                        Verify = Free (read-only)
+                      </span>
+                      <span className="flex items-center gap-1">
+                        <span className="inline-block w-1.5 h-1.5 rounded-full bg-purple-500" />
+                        📜 Record = On-chain (gas)
+                      </span>
+                    </div>
+                  )}
+
+                  {/* Info text */}
+                  {showProofStatus === 'generating' && (
+                    <p className="text-gray-500 text-xs mt-3 text-center">
+                      The ZK proof ensures cards were revealed honestly. Please wait...
+                    </p>
+                  )}
+                  {showProofStatus === 'generated' && !pendingGameEndData && (
+                    <p className="text-gray-500 text-xs mt-3 text-center">
+                      Verify the proof on Base Sepolia to confirm fair play.
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* If ZK is disabled or idle, and game end is pending, auto-proceed */}
           </div>
         </div>
+      )}
+
+      {/* Auto-proceed when no ZK verification is needed but game end is pending */}
+      {isShowdown && (!zkEnabled || showProofStatus === 'idle') && pendingGameEndData && (
+        <AutoProceed onProceed={handleProceedToResults} />
       )}
 
       {/* ZK Proof Panel */}
