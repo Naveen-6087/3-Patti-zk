@@ -101,6 +101,31 @@ export default function CreateRoomModal({ isOpen, onClose, onSuccess, socket }) 
         // Convert balance to number (in tokens, not wei)
         const tokenBalance = balance ? parseFloat(ethers.formatEther(balance)) : 0;
 
+        // Set up listeners BEFORE emitting to avoid race condition
+        const roomCreatedPromise = new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            socket.off('roomCreated', onRoomCreated);
+            socket.off('error', onError);
+            // Fallback: navigate directly with blockchain room ID
+            resolve({ roomId: blockchainRoomId, shortCode: null, fallback: true });
+          }, 10000);
+
+          const onRoomCreated = ({ roomId, shortCode }) => {
+            clearTimeout(timeout);
+            socket.off('error', onError);
+            resolve({ roomId, shortCode });
+          };
+
+          const onError = ({ message: errMsg }) => {
+            clearTimeout(timeout);
+            socket.off('roomCreated', onRoomCreated);
+            reject(new Error(errMsg));
+          };
+
+          socket.once('roomCreated', onRoomCreated);
+          socket.once('error', onError);
+        });
+
         socket.emit('createRoomWithBlockchain', {
           blockchainRoomId: blockchainRoomId.toString(),
           buyIn: buyIn,
@@ -108,32 +133,27 @@ export default function CreateRoomModal({ isOpen, onClose, onSuccess, socket }) 
           creator: account,
           txHash: createResult.txHash,
           tokenBalance: tokenBalance,
-          // Provide numeric buy-in in tokens so backend initializes off-chain chips correctly
           buyInTokens: Number(buyIn)
         });
 
-        // Wait for backend confirmation
-        socket.once('roomCreated', ({ roomId, shortCode }) => {
+        try {
+          const { roomId, shortCode, fallback } = await roomCreatedPromise;
           setLoading(false);
           setStep('input');
 
-          // Store short code for display
           if (shortCode) {
             setCreatedRoomCode(shortCode);
             setMessage(`Room created! Share code: ${shortCode}`);
           }
 
-          // Give user a moment to see the code before navigating
           setTimeout(() => {
             onSuccess(roomId, blockchainRoomId);
           }, shortCode ? 1500 : 0);
-        });
-
-        socket.once('error', ({ message }) => {
+        } catch (promiseErr) {
           setLoading(false);
           setStep('input');
-          setError(message);
-        });
+          setError(promiseErr.message);
+        }
       } else {
         // No socket, just return success
         setLoading(false);

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import gsap from "gsap";
 import { useParams, useLocation, useNavigate } from "react-router-dom";
 import { useReadContract } from "wagmi";
@@ -17,8 +17,20 @@ import {
 import Button from "@/components/Button";
 import PlayerSeat from "@/components/PlayerSeat";
 import PlayingCard from "@/components/PlayingCard";
+import ZKProofPanel, { notifyZKProof } from "@/components/ZKProofPanel";
 import { formatChips, formatRoomId, getShortRoomCode } from "@/lib/utils";
 import { useContracts } from "@/hooks/useContracts";
+import {
+  useZK,
+  prepareDeckForZK,
+  buildShuffleInput,
+  buildDealInput,
+  buildShowInputFromBackendCards,
+  generateShuffleProof,
+  generateDealProof,
+  generateShowProof,
+  submitProofToZkVerify,
+} from "@/lib/zk";
 import GameABI from "@/contracts/TeenPattiGame.json";
 import addresses from "@/contracts/addresses.json";
 import GlowingBackground from "@/components/GlowingBackground";
@@ -48,6 +60,23 @@ export default function GameRoom({ socket }) {
   const [startingGame, setStartingGame] = useState(false);
   const [gameEnded, setGameEnded] = useState(false);
   const [winnerInfo, setWinnerInfo] = useState(null);
+
+  // ── ZK Proof State ──
+  const zkContext = useZK();
+  const [zkEnabled, setZkEnabled] = useState(true);
+  const [zkStats, setZkStats] = useState({
+    proofsGenerated: 0,
+    proofsVerified: 0,
+    totalGenerationTime: 0,
+  });
+
+  // ── ZK Refs (accessible from async socket handlers) ──
+  const deckStateRef = useRef(null);
+  const deckStatePromiseRef = useRef(null);
+  const zkEnabledRef = useRef(zkEnabled);
+  const zkContextRef = useRef(zkContext);
+  useEffect(() => { zkEnabledRef.current = zkEnabled; }, [zkEnabled]);
+  useEffect(() => { zkContextRef.current = zkContext; });
 
   // Use wagmi's useReadContract to fetch room details reactively
   const { data: blockchainRoomDetails, refetch: refetchRoomDetails } =
@@ -97,16 +126,116 @@ export default function GameRoom({ socket }) {
       if (refetchRoomDetails) refetchRoomDetails();
     });
 
-    socket.on("gameStarted", async ({ gameState: newGameState }) => {
+    socket.on("gameStarted", async ({ gameState: newGameState, shuffledDeck }) => {
       setGameState(newGameState);
       setMessage("Game started! Place your bets.");
       setTimeout(() => setMessage(""), 3000);
       // Refresh blockchain data immediately
       if (refetchRoomDetails) refetchRoomDetails();
+
+      // ── ZK: Generate shuffle proof ──
+      if (zkEnabledRef.current && shuffledDeck && shuffledDeck.length === 52 && zkContextRef.current.isReady) {
+        try {
+          notifyZKProof('generating', 'shuffle', 'Preparing deck for ZK verification...');
+
+          // Prepare deck state (UIDs, nonces, Merkle tree) — store for deal/show proofs
+          const deckPromise = prepareDeckForZK(shuffledDeck);
+          deckStatePromiseRef.current = deckPromise;
+          const deckState = await deckPromise;
+          deckStateRef.current = { ...deckState, shuffledDeck };
+
+          // Build & generate shuffle proof
+          const shuffleInput = buildShuffleInput(deckState.canonicalUIDs, deckState.shuffledUIDs);
+          notifyZKProof('generating', 'shuffle', 'Generating shuffle proof...');
+          const proof = await generateShuffleProof(shuffleInput);
+
+          const shuffleProofId = zkContextRef.current.trackProof('shuffle', proof);
+          notifyZKProof('success', 'shuffle', 'Deck shuffled fairly — ZK verified!');
+          setZkStats(prev => ({
+            ...prev,
+            proofsGenerated: prev.proofsGenerated + 1,
+          }));
+
+          // ── zkVerify Kurier submission ──
+          if (zkContextRef.current.isZkVerifyAvailable) {
+            try {
+              console.log('[zkVerify] Submitting shuffle proof to Kurier...');
+              const kurierResult = await submitProofToZkVerify({ circuitName: 'shuffle', proof });
+              console.log('[zkVerify] Shuffle proof submitted. Job ID:', kurierResult.jobId);
+              zkContextRef.current.updateProofTracking(shuffleProofId, kurierResult.jobId, { status: 'submitted' });
+            } catch (kurierErr) {
+              console.warn('[zkVerify] Shuffle Kurier submission failed:', kurierErr.message);
+            }
+          }
+        } catch (err) {
+          console.error('[ZK] Shuffle proof failed:', err);
+          notifyZKProof('error', 'shuffle', `Shuffle proof failed: ${err.message}`);
+        }
+      }
     });
 
-    socket.on("yourCards", ({ cards }) => {
+    socket.on("yourCards", async ({ cards }) => {
       setMyCards(cards);
+
+      // ── ZK: Generate deal proof ──
+      if (zkEnabledRef.current && zkContextRef.current.isReady && cards && cards.length === 3) {
+        try {
+          // Wait for deck state to be ready (from gameStarted handler)
+          if (deckStatePromiseRef.current) {
+            await deckStatePromiseRef.current;
+          }
+          if (!deckStateRef.current) return;
+
+          notifyZKProof('generating', 'deal', 'Generating deal proof...');
+          const { shuffledUIDs, nonces, merkleRoot, merkleLayers, shuffledDeck } = deckStateRef.current;
+
+          // Find card positions in shuffled deck
+          const positions = [];
+          const cardUIDs = [];
+          const cardNonces = [];
+          for (const card of cards) {
+            const idx = shuffledDeck.findIndex(d => d.rank === card.rank && d.suit === card.suit);
+            if (idx === -1) throw new Error(`Card ${card.rank} of ${card.suit} not found in deck`);
+            positions.push(idx);
+            cardUIDs.push(shuffledUIDs[idx]);
+            cardNonces.push(nonces[idx]);
+          }
+
+          // Convert player ID to BigInt for circuit input
+          const playerIdBigInt = playerId.startsWith('0x') ? BigInt(playerId) : BigInt(0);
+          const dealInput = buildDealInput(
+            playerIdBigInt,
+            merkleRoot,
+            positions,
+            cardUIDs,
+            cardNonces,
+            merkleLayers
+          );
+          const proof = await generateDealProof(dealInput);
+
+          const dealProofId = zkContextRef.current.trackProof('deal', proof);
+          notifyZKProof('success', 'deal', 'Cards dealt fairly from committed deck!');
+          setZkStats(prev => ({
+            ...prev,
+            proofsGenerated: prev.proofsGenerated + 1,
+          }));
+
+          // ── zkVerify Kurier submission ──
+          if (zkContextRef.current.isZkVerifyAvailable) {
+            try {
+              console.log('[zkVerify] Submitting deal proof to Kurier...');
+              const kurierResult = await submitProofToZkVerify({ circuitName: 'deal', proof });
+              console.log('[zkVerify] Deal proof submitted. Job ID:', kurierResult.jobId);
+              zkContextRef.current.updateProofTracking(dealProofId, kurierResult.jobId, { status: 'submitted' });
+            } catch (kurierErr) {
+              console.warn('[zkVerify] Deal Kurier submission failed:', kurierErr.message);
+            }
+          }
+        } catch (err) {
+          console.error('[ZK] Deal proof failed:', err);
+          notifyZKProof('error', 'deal', `Deal proof failed: ${err.message}`);
+        }
+      }
     });
 
     socket.on("playerSawCards", ({ gameState: newGameState }) => {
@@ -145,7 +274,7 @@ export default function GameRoom({ socket }) {
       setTimeout(() => setMessage(""), 3000);
     });
 
-    socket.on("showdownStarted", ({ allCards, gameState: newGameState }) => {
+    socket.on("showdownStarted", async ({ allCards, gameState: newGameState }) => {
       setGameState(newGameState);
       setShowCards(true);
       if (allCards) {
@@ -154,15 +283,69 @@ export default function GameRoom({ socket }) {
       setIsShowdown(true);
       setMessage("Showdown! Revealing cards...");
 
-      // Update myCards if I am part of the game (though showCards=true handles visibility)
-      // But we might want to ensure we have the data if we didn't before
       if (allCards && playerId && allCards[playerId]) {
         setMyCards(allCards[playerId]);
       }
 
-      // We could also store other players' cards in a state if we want to show them explicitly
-      // currently PlayerSeat logic might need adjustment to show OPPONENT cards if showCards is true
-      // Let's check PlayerSeat logic.
+      // ── ZK: Generate show proof (proves hand was revealed honestly) ──
+      if (zkEnabledRef.current && zkContextRef.current.isReady && deckStateRef.current && allCards && allCards[playerId]) {
+        try {
+          notifyZKProof('generating', 'show', 'Generating reveal proof...');
+          const myCardsForShow = allCards[playerId];
+          const { shuffledUIDs, nonces, merkleRoot, merkleLayers, shuffledDeck } = deckStateRef.current;
+
+          // Find card positions in shuffled deck
+          const positions = [];
+          const cardUIDs = [];
+          const cardNonces = [];
+          for (const card of myCardsForShow) {
+            const idx = shuffledDeck.findIndex(d => d.rank === card.rank && d.suit === card.suit);
+            if (idx === -1) throw new Error(`Card ${card.rank} of ${card.suit} not found in deck`);
+            positions.push(idx);
+            cardUIDs.push(shuffledUIDs[idx]);
+            cardNonces.push(nonces[idx]);
+          }
+
+          // Convert IDs to BigInt for circuit inputs
+          const gameIdBigInt = blockchainRoomId && blockchainRoomId.startsWith('0x')
+            ? BigInt(blockchainRoomId) : BigInt(1);
+          const playerIdBigInt = playerId.startsWith('0x') ? BigInt(playerId) : BigInt(0);
+
+          const { input } = await buildShowInputFromBackendCards(
+            gameIdBigInt,
+            playerIdBigInt,
+            merkleRoot,
+            myCardsForShow,
+            cardUIDs,
+            cardNonces,
+            positions,
+            merkleLayers
+          );
+
+          const proof = await generateShowProof(input);
+          const showProofId = zkContextRef.current.trackProof('show', proof);
+          notifyZKProof('success', 'show', 'Hand revealed honestly — ZK verified!');
+          setZkStats(prev => ({
+            ...prev,
+            proofsGenerated: prev.proofsGenerated + 1,
+          }));
+
+          // ── zkVerify Kurier submission ──
+          if (zkContextRef.current.isZkVerifyAvailable) {
+            try {
+              console.log('[zkVerify] Submitting show proof to Kurier...');
+              const kurierResult = await submitProofToZkVerify({ circuitName: 'show', proof });
+              console.log('[zkVerify] Show proof submitted. Job ID:', kurierResult.jobId);
+              zkContextRef.current.updateProofTracking(showProofId, kurierResult.jobId, { status: 'submitted' });
+            } catch (kurierErr) {
+              console.warn('[zkVerify] Show Kurier submission failed:', kurierErr.message);
+            }
+          }
+        } catch (err) {
+          console.error('[ZK] Show proof failed:', err);
+          notifyZKProof('error', 'show', `Show proof failed: ${err.message}`);
+        }
+      }
     });
 
     socket.on("gameEnded", async ({ winner, pot, allCards, reason, playerChips }) => {
@@ -218,7 +401,9 @@ export default function GameRoom({ socket }) {
       socket.off("playerSawCards");
       socket.off("actionPerformed");
       socket.off("turnChanged");
+      socket.off("showdownStarted");
       socket.off("gameEnded");
+      socket.off("gameSettled");
       socket.off("playerLeft");
       socket.off("error");
     };
@@ -1071,6 +1256,13 @@ export default function GameRoom({ socket }) {
           </div>
         </div>
       )}
+
+      {/* ZK Proof Panel */}
+      <ZKProofPanel
+        enabled={zkEnabled}
+        onToggle={setZkEnabled}
+        stats={zkStats}
+      />
 
       {/* Game Ended Overlay */}
       {
